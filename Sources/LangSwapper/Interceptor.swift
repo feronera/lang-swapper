@@ -23,7 +23,10 @@ final class Interceptor {
     private let eventSource = CGEventSource(stateID: .privateState)
 
     private var strokes: [KeyStroke] = []
-    private var lastCorrection: (correction: Correction, delimiter: CGEvent)?
+    private var lastCorrection: (correction: Correction, delimiter: CGEvent, word: String)?
+    /// Words just typed and left alone, each followed by one space, oldest first.
+    /// A later fix may reread them (short words like `z,` for ผม are ambiguous alone).
+    private var recentWords: [(strokes: [KeyStroke], typed: String, language: Language)] = []
 
     private enum Key {
         static let space: UInt16 = 49, returnKey: UInt16 = 36, tab: UInt16 = 48, enter: UInt16 = 76
@@ -59,6 +62,7 @@ final class Interceptor {
 
     func reset() {
         strokes.removeAll()
+        recentWords.removeAll()
         lastCorrection = nil
     }
 
@@ -85,7 +89,7 @@ final class Interceptor {
         // ⌘Z right after a fix undoes the fix, not the app's last edit.
         if keyCode == Key.z, flags.contains(.maskCommand), !flags.contains(.maskShift),
            strokes.isEmpty, let last = lastCorrection {
-            undo(last.correction, delimiter: last.delimiter)
+            undo(last.correction, delimiter: last.delimiter, word: last.word)
             return nil
         }
         if flags.contains(.maskCommand) || flags.contains(.maskControl) || flags.contains(.maskAlternate) {
@@ -95,9 +99,11 @@ final class Interceptor {
 
         if keyCode == Key.delete {
             if strokes.isEmpty, let last = lastCorrection {
-                undo(last.correction, delimiter: last.delimiter)
+                undo(last.correction, delimiter: last.delimiter, word: last.word)
                 return nil
             }
+            // Deleting a space joins words; the earlier ones no longer match the field.
+            if strokes.isEmpty { recentWords.removeAll() }
             lastCorrection = nil
             if !strokes.isEmpty { strokes.removeLast() }
             return pass
@@ -110,19 +116,27 @@ final class Interceptor {
                 lastCorrection = nil
                 return pass
             }
-            guard let correction = detector.decide(strokes: strokes, typed: typed, current: current,
-                                                   layouts: inputSources.layouts, ignoring: store.ignoredWords,
-                                                   category: category),
+            guard let wordFix = detector.decide(strokes: strokes, typed: typed, current: current,
+                                                layouts: inputSources.layouts, ignoring: store.ignoredWords,
+                                                category: category),
                   let delimiter = event.copy() else {
                 lastCorrection = nil
+                if keyCode == Key.space && !strokes.isEmpty {
+                    recentWords.append((strokes, typed, current))
+                    if recentWords.count > 3 { recentWords.removeFirst() }
+                } else {
+                    recentWords.removeAll()
+                }
                 // Count only words that read as real text, not passwords or noise.
                 if strokes.count >= detector.minimumStrokes, detector.score(typed, as: current) > detector.rejectThreshold {
                     store.recordLanguage(current, in: frontBundleID)
                 }
                 return pass
             }
+            let correction = extendBackwards(wordFix)
+            recentWords.removeAll()
             // Swallow the delimiter now; replay it after the rewrite so ordering holds.
-            DispatchQueue.main.async { self.apply(correction, delimiter: delimiter) }
+            DispatchQueue.main.async { self.apply(correction, delimiter: delimiter, word: typed) }
             return nil
         }
 
@@ -159,7 +173,21 @@ final class Interceptor {
         }
     }
 
-    private func apply(_ correction: Correction, delimiter: CGEvent) {
+    /// Folds immediately preceding words that read better in the fix's language into one rewrite.
+    private func extendBackwards(_ fix: Correction) -> Correction {
+        var original = fix.original, replacement = fix.replacement
+        for word in recentWords.reversed() {
+            guard word.language == fix.from,
+                  let alt = detector.reread(strokes: word.strokes, typed: word.typed, current: word.language,
+                                            as: fix.to, layouts: inputSources.layouts,
+                                            ignoring: store.ignoredWords, category: category) else { break }
+            original = word.typed + " " + original
+            replacement = alt + " " + replacement
+        }
+        return Correction(original: original, replacement: replacement, from: fix.from, to: fix.to)
+    }
+
+    private func apply(_ correction: Correction, delimiter: CGEvent, word: String) {
         // Backspacing blind is only safe if the field holds what we think it does.
         // Unreadable fields fall back to trusting our keystroke buffer.
         if FocusedText.check(endsWith: correction.original) == .mismatch {
@@ -172,13 +200,13 @@ final class Interceptor {
         replace(scalarCount: correction.original.unicodeScalars.count, with: correction.replacement)
         inputSources.select(correction.to)
         post(delimiter)
-        lastCorrection = (correction, delimiter)
+        lastCorrection = (correction, delimiter, word)
         onCorrection?(correction)
     }
 
-    private func undo(_ correction: Correction, delimiter: CGEvent) {
+    private func undo(_ correction: Correction, delimiter: CGEvent, word: String) {
         lastCorrection = nil
-        store.ignore(correction.original)
+        store.ignore(word)
         store.correctLanguage(from: correction.to, to: correction.from, in: frontBundleID)
         DispatchQueue.main.async {
             // The field should end with our replacement plus the replayed delimiter.

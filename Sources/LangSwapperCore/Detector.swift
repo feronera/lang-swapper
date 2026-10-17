@@ -5,6 +5,13 @@ public struct Correction: Sendable, Equatable {
     public let replacement: String
     public let from: Language
     public let to: Language
+
+    public init(original: String, replacement: String, from: Language, to: Language) {
+        self.original = original
+        self.replacement = replacement
+        self.from = from
+        self.to = to
+    }
 }
 
 /// Decides whether a word was typed on the wrong layout by re-rendering its
@@ -20,6 +27,13 @@ public final class Detector: @unchecked Sendable {
     /// The typed text may be a real but rare word ("mew" for ทำไม). Replace it
     /// anyway when the other rendering scores this much higher.
     public var dominanceMargin = 0.2
+    /// Words reread after a later fix are kept when they score at least this in
+    /// their own language (about the top 200 words).
+    public var rereadKeepScore = 0.8
+    /// Languages earlier words may be reread into. On the top 5000 words, rereading into
+    /// Thai recovers ~80% of missed short words with 0.5% false changes; into English it
+    /// recovers few words and changes ~3% of correct short Thai words, so it is off.
+    public var rereadTargets: Set<Language> = [.thai]
 
     public init(dictionaries: [Language: FrequencyDictionary]) {
         self.dictionaries = dictionaries
@@ -65,6 +79,20 @@ public final class Detector: @unchecked Sendable {
         guard let (correction, altScore) = best else { return nil }
         if force { return correction }
         return altScore >= acceptThreshold && altScore > typedScore && altScore >= required ? correction : nil
+    }
+
+    /// After a later word was fixed to `target`, decides whether an earlier word
+    /// left alone (short words like `z,` for ผม are ambiguous on their own) should
+    /// be fixed too. Returns its `target` rendering, or nil to keep it.
+    public func reread(strokes: [KeyStroke], typed: String, current: Language, as target: Language,
+                       layouts: [Language: LayoutMap], ignoring ignored: Set<String> = [],
+                       category: AppCategory = .general) -> String? {
+        guard target != current, rereadTargets.contains(target), !ignored.contains(typed), !ProtectedWords.contains(typed, in: category),
+              let alt = layouts[target]?.render(strokes), alt != typed else { return nil }
+        let altScore = score(alt, as: target), typedScore = score(typed, as: current)
+        // Common words (นา, ทำ, go) stay: mixed-language text is normal. Rare ones (fu, z) may go.
+        guard typedScore < rereadKeepScore else { return nil }
+        return altScore >= acceptThreshold && altScore > typedScore ? alt : nil
     }
 
     private static let englishEdgePunctuation = CharacterSet(charactersIn: ".,!?;:\"'()[]{}<>")

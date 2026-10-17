@@ -9,7 +9,10 @@ public final class FrequencyDictionary: @unchecked Sendable {
     /// Longest entry measured in Unicode scalars, bounds the segmentation search.
     public let maxScalarLength: Int
 
-    public init(contents: String) {
+    /// - Parameter splitCompounds: for lists built from unsegmented text (Thai subtitles hold
+    ///   entries like "คุณมาทำอะไรที่นี่"), also credit each entry's count to the words it splits into,
+    ///   so short everyday words like ทำ rank as high as they are common.
+    public init(contents: String, splitCompounds: Bool = false) {
         var counts: [String: Int] = [:]
         var maxLen = 0
         for line in contents.split(whereSeparator: \.isNewline) {
@@ -20,6 +23,7 @@ public final class FrequencyDictionary: @unchecked Sendable {
             if n > counts[word, default: 0] { counts[word] = n }
             maxLen = max(maxLen, word.unicodeScalars.count)
         }
+        if splitCompounds { counts = Self.creditingParts(of: counts, maxLength: min(maxLen, 24)) }
         self.counts = counts
         var ranks: [String: Int] = [:]
         for (i, word) in counts.keys.sorted(by: { counts[$0]! > counts[$1]! }).enumerated() { ranks[word] = i + 1 }
@@ -27,8 +31,43 @@ public final class FrequencyDictionary: @unchecked Sendable {
         self.maxScalarLength = min(maxLen, 24)
     }
 
-    public convenience init(url: URL) throws {
-        self.init(contents: try String(contentsOf: url, encoding: .utf8))
+    public convenience init(url: URL, splitCompounds: Bool = false) throws {
+        self.init(contents: try String(contentsOf: url, encoding: .utf8), splitCompounds: splitCompounds)
+    }
+
+    /// Splits each entry into the fewest other entries (two scalars or more) that cover it
+    /// exactly, and adds the entry's count to each of them.
+    private static func creditingParts(of counts: [String: Int], maxLength: Int) -> [String: Int] {
+        var result = counts
+        for (entry, n) in counts {
+            let scalars = Array(entry.unicodeScalars)
+            let len = scalars.count
+            guard len >= 4 else { continue }
+            // pieces[i]: fewest words covering scalars[0..<i]; from[i]: where the last one starts.
+            var pieces = [Int](repeating: .max, count: len + 1)
+            var from = [Int](repeating: -1, count: len + 1)
+            pieces[0] = 0
+            for i in 2...len {
+                for j in max(0, i - maxLength)...(i - 2) where pieces[j] != .max && !(j == 0 && i == len) {
+                    var view = String.UnicodeScalarView()
+                    view.append(contentsOf: scalars[j..<i])
+                    if counts[String(view)] != nil, pieces[j] + 1 < pieces[i] {
+                        pieces[i] = pieces[j] + 1
+                        from[i] = j
+                    }
+                }
+            }
+            guard pieces[len] != .max else { continue }
+            var end = len
+            while end > 0 {
+                let start = from[end]
+                var view = String.UnicodeScalarView()
+                view.append(contentsOf: scalars[start..<end])
+                result[String(view), default: 0] += n
+                end = start
+            }
+        }
+        return result
     }
 
     public var isEmpty: Bool { counts.isEmpty }

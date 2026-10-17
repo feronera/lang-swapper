@@ -171,7 +171,7 @@ enum Dictionaries {
     static func makeDetector() -> Detector {
         var dicts: [Language: FrequencyDictionary] = [:]
         for language in Language.allCases {
-            if let url = url(for: language), let dict = try? FrequencyDictionary(url: url) {
+            if let url = url(for: language), let dict = try? FrequencyDictionary(url: url, splitCompounds: language == .thai) {
                 dicts[language] = dict
             } else {
                 NSLog("LangSwapper: missing dictionary for \(language.rawValue)")

@@ -111,6 +111,40 @@ enum SelfTest {
             print("  sample misses:", misses.joined(separator: " "))
             print("  sample wrongly changed:", falsePositives.joined(separator: " "))
         }
+
+        // Phrases: a short word followed by a long one, both typed on the wrong layout.
+        // Once the long word is fixed, rereading should recover the short word.
+        func ranked(_ language: Language) -> [String] {
+            guard let url = Dictionaries.url(for: language), let text = try? String(contentsOf: url) else { return [] }
+            return text.split(separator: "\n").prefix(n).compactMap { $0.split(separator: " ").first.map(String.init) }
+        }
+        for language in [Language.english, .thai] {
+            let intended = language == .english ? en : th
+            let wrong = language == .english ? th : en
+            let words = ranked(language)
+            let missedShort = words.filter { w in
+                guard let st = strokes(for: w, in: intended), (2...3).contains(st.count), let typed = wrong.render(st) else { return false }
+                return detector.decide(strokes: st, typed: typed, current: wrong.language, layouts: layouts)?.replacement != w
+            }
+            let recovered = missedShort.filter { w in
+                guard let st = strokes(for: w, in: intended), let typed = wrong.render(st) else { return false }
+                return detector.reread(strokes: st, typed: typed, current: wrong.language, as: language, layouts: layouts) == w
+            }
+            // Mixed text: a correct short word in the other language, then a wrong-layout word in this one.
+            let otherShort = ranked(wrong.language).filter { w in
+                guard let st = strokes(for: w, in: wrong) else { return false }
+                return (2...3).contains(st.count)
+            }
+            let converted = otherShort.filter { w in
+                guard let st = strokes(for: w, in: wrong) else { return false }
+                return detector.reread(strokes: st, typed: w, current: wrong.language, as: language, layouts: layouts) != nil
+            }
+            print(String(format: "\nphrases ending in a fixed %@ word: recovered %d/%d missed short words (%.1f%%); converted %d/%d correct short %@ words (%.1f%%)",
+                         language.rawValue, recovered.count, missedShort.count, 100 * Double(recovered.count) / Double(max(1, missedShort.count)),
+                         converted.count, otherShort.count, wrong.language.rawValue, 100 * Double(converted.count) / Double(max(1, otherShort.count))))
+            print("  still missed:", missedShort.filter { !recovered.contains($0) }.prefix(15).joined(separator: " "))
+            print("  wrongly converted:", converted.prefix(15).joined(separator: " "))
+        }
     }
 
     /// Inverts a layout to find the keystrokes that type `text`.
