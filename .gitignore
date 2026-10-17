@@ -1,0 +1,5 @@
+.build/
+build/
+# Downloaded by scripts/build-app.sh (CC BY-SA 4.0, see README)
+Data/*.txt
+.DS_Store

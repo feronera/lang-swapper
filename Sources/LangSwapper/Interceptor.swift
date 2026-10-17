@@ -1,0 +1,221 @@
+import AppKit
+import Carbon
+import LangSwapperCore
+
+/// Watches keystrokes through a CGEventTap, keeps the current word as physical
+/// keystrokes, and rewrites it when the Detector says the layout was wrong.
+final class Interceptor {
+    /// Marks events we post so the tap lets them through untouched.
+    static let syntheticTag: Int64 = 0x4C53_5750 // "LSWP"
+
+    var enabled = true
+    var onCorrection: ((Correction) -> Void)?
+    /// Set from the app delegate when the front app changes.
+    var frontBundleID: String? {
+        didSet { category = AppCategory(bundleID: frontBundleID); reset() }
+    }
+
+    private let detector: Detector
+    private let inputSources: InputSources
+    private let store: UserStore
+    private var category = AppCategory.general
+    private var tap: CFMachPort?
+    private let eventSource = CGEventSource(stateID: .privateState)
+
+    private var strokes: [KeyStroke] = []
+    private var lastCorrection: (correction: Correction, delimiter: CGEvent)?
+
+    private enum Key {
+        static let space: UInt16 = 49, returnKey: UInt16 = 36, tab: UInt16 = 48, enter: UInt16 = 76
+        static let delete: UInt16 = 51, escape: UInt16 = 53, z: UInt16 = 6
+        static let navigation: Set<UInt16> = [115, 116, 117, 119, 121, 123, 124, 125, 126]
+    }
+
+    init(detector: Detector, inputSources: InputSources, store: UserStore) {
+        self.detector = detector
+        self.inputSources = inputSources
+        self.store = store
+    }
+
+    @discardableResult
+    func start() -> Bool {
+        guard tap == nil else { return true }
+        let mask = (1 << CGEventType.keyDown.rawValue) | (1 << CGEventType.leftMouseDown.rawValue)
+            | (1 << CGEventType.rightMouseDown.rawValue)
+        let callback: CGEventTapCallBack = { _, type, event, refcon in
+            let me = Unmanaged<Interceptor>.fromOpaque(refcon!).takeUnretainedValue()
+            return me.handle(type: type, event: event)
+        }
+        guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap,
+                                          options: .defaultTap, eventsOfInterest: CGEventMask(mask),
+                                          callback: callback,
+                                          userInfo: Unmanaged.passUnretained(self).toOpaque()) else { return false }
+        self.tap = tap
+        let source = CFMachPortCreateRunLoopSource(nil, tap, 0)
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+        CGEvent.tapEnable(tap: tap, enable: true)
+        return true
+    }
+
+    func reset() {
+        strokes.removeAll()
+        lastCorrection = nil
+    }
+
+    // MARK: - Event handling (runs on the main run loop; keep it fast)
+
+    private func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
+        let pass = Unmanaged.passUnretained(event)
+        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
+            return pass
+        }
+        if event.getIntegerValueField(.eventSourceUserData) == Self.syntheticTag { return pass }
+        guard type == .keyDown else { reset(); return pass }
+        guard enabled, !IsSecureEventInputEnabled(), !store.isExcluded(frontBundleID) else { reset(); return pass }
+
+        let keyCode = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
+        let flags = event.flags
+
+        // ⌃⌥Space: convert the current word now, whatever the detector thinks.
+        if flags.contains(.maskControl) && flags.contains(.maskAlternate) && keyCode == Key.space {
+            convertCurrentWord()
+            return nil
+        }
+        // ⌘Z right after a fix undoes the fix, not the app's last edit.
+        if keyCode == Key.z, flags.contains(.maskCommand), !flags.contains(.maskShift),
+           strokes.isEmpty, let last = lastCorrection {
+            undo(last.correction, delimiter: last.delimiter)
+            return nil
+        }
+        if flags.contains(.maskCommand) || flags.contains(.maskControl) || flags.contains(.maskAlternate) {
+            reset()
+            return pass
+        }
+
+        if keyCode == Key.delete {
+            if strokes.isEmpty, let last = lastCorrection {
+                undo(last.correction, delimiter: last.delimiter)
+                return nil
+            }
+            lastCorrection = nil
+            if !strokes.isEmpty { strokes.removeLast() }
+            return pass
+        }
+
+        if [Key.space, Key.returnKey, Key.tab, Key.enter].contains(keyCode) {
+            defer { strokes.removeAll() }
+            guard let current = inputSources.currentLanguage(),
+                  let typed = inputSources.layouts[current]?.render(strokes) else {
+                lastCorrection = nil
+                return pass
+            }
+            guard let correction = detector.decide(strokes: strokes, typed: typed, current: current,
+                                                   layouts: inputSources.layouts, ignoring: store.ignoredWords,
+                                                   category: category),
+                  let delimiter = event.copy() else {
+                lastCorrection = nil
+                // Count only words that read as real text, not passwords or noise.
+                if strokes.count >= detector.minimumStrokes, detector.score(typed, as: current) > detector.rejectThreshold {
+                    store.recordLanguage(current, in: frontBundleID)
+                }
+                return pass
+            }
+            // Swallow the delimiter now; replay it after the rewrite so ordering holds.
+            DispatchQueue.main.async { self.apply(correction, delimiter: delimiter) }
+            return nil
+        }
+
+        if keyCode == Key.escape || Key.navigation.contains(keyCode) {
+            reset()
+            return pass
+        }
+
+        let stroke = KeyStroke(keyCode: keyCode, shift: flags.contains(.maskShift))
+        guard let current = inputSources.currentLanguage(),
+              inputSources.layouts[current]?.produces(stroke) == true else {
+            reset()
+            return pass
+        }
+        lastCorrection = nil
+        strokes.append(stroke)
+        if strokes.count > 48 { reset() }
+        return pass
+    }
+
+    // MARK: - Rewriting
+
+    private func convertCurrentWord() {
+        guard !strokes.isEmpty, let current = inputSources.currentLanguage(),
+              let typed = inputSources.layouts[current]?.render(strokes),
+              let correction = detector.decide(strokes: strokes, typed: typed, current: current,
+                                               layouts: inputSources.layouts, force: true) else { return }
+        strokes.removeAll()
+        DispatchQueue.main.async {
+            guard FocusedText.check(endsWith: correction.original) != .mismatch else { return }
+            self.replace(scalarCount: correction.original.unicodeScalars.count, with: correction.replacement)
+            self.inputSources.select(correction.to)
+            self.onCorrection?(correction)
+        }
+    }
+
+    private func apply(_ correction: Correction, delimiter: CGEvent) {
+        // Backspacing blind is only safe if the field holds what we think it does.
+        // Unreadable fields fall back to trusting our keystroke buffer.
+        if FocusedText.check(endsWith: correction.original) == .mismatch {
+            NSLog("LangSwapper: field text doesn't end with the typed word; skipping fix")
+            post(delimiter)
+            lastCorrection = nil
+            return
+        }
+        store.recordLanguage(correction.to, in: frontBundleID)
+        replace(scalarCount: correction.original.unicodeScalars.count, with: correction.replacement)
+        inputSources.select(correction.to)
+        post(delimiter)
+        lastCorrection = (correction, delimiter)
+        onCorrection?(correction)
+    }
+
+    private func undo(_ correction: Correction, delimiter: CGEvent) {
+        lastCorrection = nil
+        store.ignore(correction.original)
+        store.correctLanguage(from: correction.to, to: correction.from, in: frontBundleID)
+        DispatchQueue.main.async {
+            // The field should end with our replacement plus the replayed delimiter.
+            if let prefix = FocusedText.textBeforeCaret(), !prefix.dropLast().hasSuffix(correction.replacement) { return }
+            // +1 removes the replayed delimiter, which we type again after the original.
+            self.replace(scalarCount: correction.replacement.unicodeScalars.count + 1, with: correction.original)
+            self.post(delimiter)
+            self.inputSources.select(correction.from)
+        }
+    }
+
+    /// Deletes by Backspace (one per typed scalar; each keystroke produced one) and types `text`.
+    private func replace(scalarCount: Int, with text: String) {
+        for _ in 0..<scalarCount {
+            postKey(Key.delete, down: true)
+            postKey(Key.delete, down: false)
+        }
+        let units = Array(text.utf16)
+        for start in stride(from: 0, to: units.count, by: 16) {
+            let chunk = Array(units[start..<min(start + 16, units.count)])
+            for down in [true, false] {
+                guard let e = CGEvent(keyboardEventSource: eventSource, virtualKey: 0, keyDown: down) else { continue }
+                e.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: chunk)
+                e.flags = []
+                post(e)
+            }
+        }
+    }
+
+    private func postKey(_ keyCode: UInt16, down: Bool) {
+        guard let e = CGEvent(keyboardEventSource: eventSource, virtualKey: keyCode, keyDown: down) else { return }
+        e.flags = []
+        post(e)
+    }
+
+    private func post(_ event: CGEvent) {
+        event.setIntegerValueField(.eventSourceUserData, value: Self.syntheticTag)
+        event.post(tap: .cghidEventTap)
+    }
+}
