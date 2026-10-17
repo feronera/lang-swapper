@@ -12,6 +12,7 @@ Requires macOS 13 or later and Xcode command-line tools.
 ./scripts/build-app.sh           # downloads word lists, builds build/LangSwapper.app
 open build/LangSwapper.app       # grant Accessibility access when asked
 swift run LangSwapper --selftest # detector checks against this Mac's real layouts
+swift run LangSwapper --eval 5000 # fix rate and false changes on the 5000 most common words
 ```
 
 Enable both an English layout (ABC or US) and the Thai layout in System Settings → Keyboard → Input Sources.

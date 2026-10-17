@@ -17,6 +17,9 @@ public final class Detector: @unchecked Sendable {
     /// Maximum confidence the typed text may have and still be replaced.
     public var rejectThreshold = 0.3
     public var minimumStrokes = 2
+    /// The typed text may be a real but rare word ("mew" for ทำไม). Replace it
+    /// anyway when the other rendering scores this much higher.
+    public var dominanceMargin = 0.2
 
     public init(dictionaries: [Language: FrequencyDictionary]) {
         self.dictionaries = dictionaries
@@ -29,13 +32,11 @@ public final class Detector: @unchecked Sendable {
         case .english:
             let word = text.trimmingCharacters(in: Self.englishEdgePunctuation).lowercased()
             guard !word.isEmpty, word.unicodeScalars.allSatisfy(Self.isEnglishWordScalar) else { return 0 }
-            let n = dict.count(of: word)
-            guard n > 0 else { return 0 }
-            return 0.6 + 0.4 * min(1, log10(Double(n)) / 6)
+            guard dict.count(of: word) > 0 else { return 0 }
+            return 0.6 + 0.4 * dict.commonness(of: word)
         case .thai:
             guard ThaiOrthography.isPlausible(text) else { return 0 }
-            let n = dict.count(of: text)
-            if n > 0 { return 0.7 + 0.3 * min(1, log10(Double(n)) / 5) }
+            if dict.count(of: text) > 0 { return 0.6 + 0.4 * dict.commonness(of: text) }
             let coverage = dict.segmentCoverage(text)
             return coverage >= 0.999 ? 0.8 : coverage * coverage * 0.75
         }
@@ -49,7 +50,9 @@ public final class Detector: @unchecked Sendable {
         guard force || strokes.count >= minimumStrokes, !ignored.contains(typed) else { return nil }
         if !force && ProtectedWords.contains(typed, in: category) { return nil }
         let typedScore = score(typed, as: current)
-        if !force && typedScore > rejectThreshold { return nil }
+        // Beyond the reject threshold only a clearly more common alternative can win.
+        let required = typedScore > rejectThreshold ? typedScore + dominanceMargin : 0
+        if !force && required > 1 { return nil }
 
         var best: (Correction, Double)?
         for (language, layout) in layouts where language != current {
@@ -61,7 +64,7 @@ public final class Detector: @unchecked Sendable {
         }
         guard let (correction, altScore) = best else { return nil }
         if force { return correction }
-        return altScore >= acceptThreshold && altScore > typedScore ? correction : nil
+        return altScore >= acceptThreshold && altScore > typedScore && altScore >= required ? correction : nil
     }
 
     private static let englishEdgePunctuation = CharacterSet(charactersIn: ".,!?;:\"'()[]{}<>")

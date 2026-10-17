@@ -72,6 +72,47 @@ enum SelfTest {
         return ok
     }
 
+    /// Measures the detector on the most frequent words of each dictionary.
+    /// Usage: `swift run LangSwapper --eval [N]`
+    static func evaluate(top n: Int) {
+        let sources = InputSources()
+        sources.reload()
+        let layouts = sources.layouts
+        guard let en = layouts[.english], let th = layouts[.thai] else { print("need EN and TH layouts"); return }
+        let detector = Dictionaries.makeDetector()
+        for language in [Language.english, .thai] {
+            guard let url = Dictionaries.url(for: language), let text = try? String(contentsOf: url) else { continue }
+            let intended = language == .english ? en : th
+            let wrong = language == .english ? th : en
+            // [length bucket: (words, fixed, wrongly changed when typed correctly)]
+            var stats: [String: (Int, Int, Int)] = [:]
+            var falsePositives: [String] = []
+            var misses: [String] = []
+            for line in text.split(separator: "\n").prefix(n) {
+                let word = String(line.split(separator: " ").first ?? "")
+                guard let strokes = strokes(for: word, in: intended), strokes.count >= 2,
+                      let typed = wrong.render(strokes) else { continue }
+                let bucket = strokes.count <= 3 ? "\(strokes.count) keys" : "4+ keys"
+                let fixed = detector.decide(strokes: strokes, typed: typed, current: wrong.language,
+                                            layouts: layouts)?.replacement == word
+                let changed = detector.decide(strokes: strokes, typed: word, current: language, layouts: layouts) != nil
+                var s = stats[bucket] ?? (0, 0, 0)
+                s.0 += 1; s.1 += fixed ? 1 : 0; s.2 += changed ? 1 : 0
+                stats[bucket] = s
+                if changed && falsePositives.count < 12 { falsePositives.append(word) }
+                if !fixed && misses.count < 12 { misses.append("\(word)(\(typed))") }
+            }
+            print("\n\(language.rawValue) top \(n):")
+            for key in stats.keys.sorted() {
+                let (w, f, c) = stats[key]!
+                print(String(format: "  %@  words %5d  fixed %5.1f%%  wrongly changed %5.2f%%", key, w,
+                             100 * Double(f) / Double(w), 100 * Double(c) / Double(w)))
+            }
+            print("  sample misses:", misses.joined(separator: " "))
+            print("  sample wrongly changed:", falsePositives.joined(separator: " "))
+        }
+    }
+
     /// Inverts a layout to find the keystrokes that type `text`.
     private static func strokes(for text: String, in layout: LayoutMap) -> [KeyStroke]? {
         var inverse: [String: KeyStroke] = [:]

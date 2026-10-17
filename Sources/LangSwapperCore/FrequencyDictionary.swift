@@ -3,6 +3,9 @@ import Foundation
 /// Ranked word list in FrequencyWords format: one "word count" pair per line.
 public final class FrequencyDictionary: @unchecked Sendable {
     private let counts: [String: Int]
+    /// 1 for the most frequent word. Comparable across languages, unlike raw counts:
+    /// the Thai corpus is hundreds of times smaller than the English one.
+    private let ranks: [String: Int]
     /// Longest entry measured in Unicode scalars, bounds the segmentation search.
     public let maxScalarLength: Int
 
@@ -18,6 +21,9 @@ public final class FrequencyDictionary: @unchecked Sendable {
             maxLen = max(maxLen, word.unicodeScalars.count)
         }
         self.counts = counts
+        var ranks: [String: Int] = [:]
+        for (i, word) in counts.keys.sorted(by: { counts[$0]! > counts[$1]! }).enumerated() { ranks[word] = i + 1 }
+        self.ranks = ranks
         self.maxScalarLength = min(maxLen, 24)
     }
 
@@ -28,6 +34,12 @@ public final class FrequencyDictionary: @unchecked Sendable {
     public var isEmpty: Bool { counts.isEmpty }
 
     public func count(of word: String) -> Int { counts[word.lowercased()] ?? 0 }
+
+    /// 0...1: 1 for the top word, falling with log rank to 0 at the end of the list; 0 if absent.
+    public func commonness(of word: String) -> Double {
+        guard let rank = ranks[word.lowercased()], ranks.count > 1 else { return 0 }
+        return 1 - log(Double(rank)) / log(Double(ranks.count))
+    }
 
     /// Fraction of scalars covered by dictionary words (each at least two scalars long)
     /// in the best segmentation. Used for scripts written without spaces, such as Thai.
