@@ -103,3 +103,43 @@ public final class FrequencyDictionary: @unchecked Sendable {
         return Double(best[n]) / Double(n)
     }
 }
+
+/// Serbian is written in both Latin and Cyrillic and maps one to one. Subtitle
+/// corpora are mostly Latin while the macOS Serbian layout types Cyrillic.
+public enum SerbianScript {
+    private static let digraphs: [(String, String)] = [("lj", "љ"), ("nj", "њ"), ("dž", "џ")]
+    private static let letters: [Character: String] = [
+        "a": "а", "b": "б", "c": "ц", "č": "ч", "ć": "ћ", "d": "д", "đ": "ђ", "e": "е", "f": "ф", "g": "г",
+        "h": "х", "i": "и", "j": "ј", "k": "к", "l": "л", "m": "м", "n": "н", "o": "о", "p": "п", "r": "р",
+        "s": "с", "š": "ш", "t": "т", "u": "у", "v": "в", "z": "з", "ž": "ж",
+    ]
+
+    /// Cyrillic spelling of a lowercase Latin Serbian word, or nil if it has other letters.
+    public static func cyrillic(_ latin: String) -> String? {
+        var rest = Substring(latin)
+        var out = ""
+        outer: while !rest.isEmpty {
+            for (pair, cyr) in digraphs where rest.hasPrefix(pair) {
+                out += cyr
+                rest = rest.dropFirst(pair.count)
+                continue outer
+            }
+            guard let cyr = letters[rest.first!] else { return nil }
+            out += cyr
+            rest = rest.dropFirst()
+        }
+        return out
+    }
+
+    /// Word list contents with a Cyrillic line added after every Latin one.
+    public static func addingCyrillic(to contents: String) -> String {
+        var out = ""
+        out.reserveCapacity(contents.utf8.count * 2)
+        for line in contents.split(whereSeparator: \.isNewline) {
+            out += line + "\n"
+            let parts = line.split(separator: " ")
+            if parts.count == 2, let cyr = cyrillic(parts[0].lowercased()) { out += "\(cyr) \(parts[1])\n" }
+        }
+        return out
+    }
+}

@@ -43,8 +43,27 @@ final class InputSources {
     static func language(of source: TISInputSource) -> Language? {
         let languages: [String] = property(source, kTISPropertyInputSourceLanguages) ?? []
         guard let primary = languages.first else { return nil }
-        return Language.allCases.first { primary.hasPrefix($0.rawValue) }
+        let language = Language(rawValue: primary)
+        return language.rawValue.isEmpty ? nil : language
     }
+
+    /// One layout per language among every layout installed on this Mac, enabled or not.
+    /// Used by --eval to measure languages the user hasn't turned on.
+    static func installedLayouts() -> [Language: LayoutMap] {
+        let filter = [kTISPropertyInputSourceType as String: kTISTypeKeyboardLayout as String] as CFDictionary
+        guard let list = TISCreateInputSourceList(filter, true)?.takeRetainedValue() as? [TISInputSource] else { return [:] }
+        var out: [Language: LayoutMap] = [:]
+        // Prefer each language's plain layout ("Russian", "Hebrew") over variants.
+        let sorted = list.sorted { (Self.idOf($0)).count < (Self.idOf($1)).count }
+        for source in sorted {
+            guard let language = language(of: source), out[language] == nil,
+                  let map = buildMap(source: source, language: language) else { continue }
+            out[language] = map
+        }
+        return out
+    }
+
+    private static func idOf(_ source: TISInputSource) -> String { property(source, kTISPropertyInputSourceID) ?? "" }
 
     /// Asks the layout what every key produces with and without Shift.
     static func buildMap(source: TISInputSource, language: Language) -> LayoutMap? {
@@ -52,26 +71,36 @@ final class InputSources {
         let id: String = property(source, kTISPropertyInputSourceID) ?? "?"
         let kbdType = UInt32(LMGetKbdType())
         var forward: [KeyStroke: String] = [:]
+        var deadKeys: [KeyStroke: [KeyStroke: String]] = [:]
+        let strokes = (UInt16(0)..<UInt16(128)).flatMap { code in [false, true].map { KeyStroke(keyCode: code, shift: $0) } }
         data.withUnsafeBytes { raw in
             guard let layout = raw.baseAddress?.assumingMemoryBound(to: UCKeyboardLayout.self) else { return }
-            for keyCode in UInt16(0)..<UInt16(128) {
-                for shift in [false, true] {
-                    var deadState: UInt32 = 0
-                    var length = 0
-                    var chars = [UniChar](repeating: 0, count: 4)
-                    let modifiers = shift ? UInt32(shiftKey >> 8) & 0xFF : 0
-                    let status = UCKeyTranslate(layout, keyCode, UInt16(kUCKeyActionDown), modifiers, kbdType,
-                                                OptionBits(kUCKeyTranslateNoDeadKeysMask), &deadState,
-                                                chars.count, &length, &chars)
-                    guard status == noErr, length > 0 else { continue }
-                    let s = String(utf16CodeUnits: chars, count: length)
-                    if s.unicodeScalars.allSatisfy(isPrintable) && s != " " {
-                        forward[KeyStroke(keyCode: keyCode, shift: shift)] = s
-                    }
+            /// Output of `stroke` from `state`; a dead key returns nil and leaves its state in `state`.
+            func translate(_ stroke: KeyStroke, _ state: inout UInt32, options: OptionBits) -> String? {
+                var length = 0
+                var chars = [UniChar](repeating: 0, count: 4)
+                let modifiers = stroke.shift ? UInt32(shiftKey >> 8) & 0xFF : 0
+                let status = UCKeyTranslate(layout, stroke.keyCode, UInt16(kUCKeyActionDown), modifiers, kbdType,
+                                            options, &state, chars.count, &length, &chars)
+                guard status == noErr, length > 0 else { return nil }
+                let s = String(utf16CodeUnits: chars, count: length)
+                return s.unicodeScalars.allSatisfy(isPrintable) && s != " " ? s : nil
+            }
+            for stroke in strokes {
+                var state: UInt32 = 0
+                if let s = translate(stroke, &state, options: OptionBits(kUCKeyTranslateNoDeadKeysMask)) { forward[stroke] = s }
+                // Dead key: no output, but a state that changes the next key.
+                var deadState: UInt32 = 0
+                guard translate(stroke, &deadState, options: 0) == nil, deadState != 0 else { continue }
+                var follow: [KeyStroke: String] = [:]
+                for next in strokes {
+                    var state = deadState
+                    if let s = translate(next, &state, options: 0), s.unicodeScalars.count == 1 { follow[next] = s }
                 }
+                if !follow.isEmpty { deadKeys[stroke] = follow }
             }
         }
-        return forward.isEmpty ? nil : LayoutMap(language: language, inputSourceID: id, forward: forward)
+        return forward.isEmpty ? nil : LayoutMap(language: language, inputSourceID: id, forward: forward, deadKeys: deadKeys)
     }
 
     private static func isPrintable(_ s: Unicode.Scalar) -> Bool {

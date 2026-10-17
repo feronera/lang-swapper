@@ -15,7 +15,8 @@ final class Interceptor {
         didSet { category = AppCategory(bundleID: frontBundleID); reset() }
     }
 
-    private let detector: Detector
+    /// Replaced when the enabled layouts change.
+    var detector: Detector
     private let inputSources: InputSources
     private let store: UserStore
     private var category = AppCategory.general

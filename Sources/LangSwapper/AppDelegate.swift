@@ -18,10 +18,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// The last app that wasn't us; opening our menu doesn't change it.
     private var frontApp: NSRunningApplication?
     private var permissionTimer: Timer?
+    /// Languages of the enabled layouts the current detector was built for.
+    private var loadedLanguages: Set<Language> = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         inputSources.reload()
-        interceptor = Interceptor(detector: Dictionaries.makeDetector(), inputSources: inputSources, store: store)
+        loadedLanguages = Set(inputSources.layouts.keys)
+        interceptor = Interceptor(detector: Dictionaries.makeDetector(for: loadedLanguages),
+                                  inputSources: inputSources, store: store)
         interceptor.onCorrection = { [weak self] c in
             self?.lastCorrectionItem.title = "Last: \(c.original) → \(c.replacement)"
         }
@@ -137,6 +141,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refreshTitle()
     }
 
+    /// Picks up layouts the user enabled or removed, loading word lists off the main thread.
+    private func reloadLayouts() {
+        inputSources.reload()
+        let languages = Set(inputSources.layouts.keys)
+        guard languages != loadedLanguages else { return }
+        loadedLanguages = languages
+        DispatchQueue.global(qos: .userInitiated).async {
+            let detector = Dictionaries.makeDetector(for: languages)
+            DispatchQueue.main.async { self.interceptor.detector = detector; self.interceptor.reset() }
+        }
+    }
+
     // MARK: - Context changes that end the current word
 
     private func observeSystem() {
@@ -147,7 +163,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         distributed.addObserver(forName: Notification.Name(kTISNotifyEnabledKeyboardInputSourcesChanged as String),
                                 object: nil, queue: .main) { [weak self] _ in
-            self?.inputSources.reload()
+            self?.reloadLayouts()
         }
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification,
                                                           object: nil, queue: .main) { [weak self] note in
@@ -168,13 +184,15 @@ enum Dictionaries {
         return FileManager.default.fileExists(atPath: dev.path) ? dev : nil
     }
 
-    static func makeDetector() -> Detector {
+    /// Loads word lists only for `languages` (the enabled layouts): each list costs a few MB.
+    static func makeDetector(for languages: some Sequence<Language>) -> Detector {
         var dicts: [Language: FrequencyDictionary] = [:]
-        for language in Language.allCases {
-            if let url = url(for: language), let dict = try? FrequencyDictionary(url: url, splitCompounds: language == .thai) {
-                dicts[language] = dict
+        for language in Set(languages) {
+            if let url = url(for: language), var contents = try? String(contentsOf: url, encoding: .utf8) {
+                if language.rawValue == "sr" { contents = SerbianScript.addingCyrillic(to: contents) }
+                dicts[language] = FrequencyDictionary(contents: contents, splitCompounds: language.writesWithoutSpaces)
             } else {
-                NSLog("LangSwapper: missing dictionary for \(language.rawValue)")
+                NSLog("LangSwapper: no word list for \(language.rawValue); its layout can't be detected")
             }
         }
         return Detector(dictionaries: dicts)

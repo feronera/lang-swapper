@@ -1,54 +1,72 @@
 import Foundation
 import LangSwapperCore
 
-/// Runs the detector against this Mac's real layouts and dictionaries.
-/// Usage: `swift run LangSwapper --selftest`
+/// Checks the detector against every keyboard layout installed on this Mac,
+/// enabled or not, so languages can be tested without turning them on.
+/// Usage: `swift run LangSwapper --selftest` and `swift run LangSwapper --eval [N]`
 enum SelfTest {
     static func run() -> Bool {
-        let sources = InputSources()
-        sources.reload()
-        let layouts = sources.layouts
-        print("Layouts:", layouts.values.map { "\($0.language.rawValue)=\($0.inputSourceID) (\($0.count) keys)" })
-        guard let en = layouts[.english], let th = layouts[.thai] else {
-            print("FAIL: need both an English and a Thai keyboard layout enabled")
+        let layouts = InputSources.installedLayouts()
+        guard let en = layouts[.english] else {
+            print("FAIL: no English layout installed")
             return false
         }
-        let detector = Dictionaries.makeDetector()
-
-        // (word as the user meant it, language it belongs to, should we switch?)
-        let cases: [(String, Language, Bool)] = [
-            ("hello", .english, true), ("world", .english, true), ("meeting", .english, true),
-            ("สวัสดี", .thai, true), ("ครับ", .thai, true), ("ภาษาไทย", .thai, true),
-            ("ขอบคุณครับ", .thai, true), ("the", .english, true), ("ไม่", .thai, true),
-            ("เป็น", .thai, true), ("people", .english, true),
+        // (word as the user meant it, its language, should typing it on the other layout get fixed?)
+        // Each word is checked against English; English words are checked against `other`.
+        let cases: [(word: String, language: String, other: String, fix: Bool)] = [
+            ("hello", "en", "th", true), ("world", "en", "th", true), ("meeting", "en", "th", true),
+            ("the", "en", "th", true), ("people", "en", "th", true),
+            ("สวัสดี", "th", "en", true), ("ครับ", "th", "en", true), ("ภาษาไทย", "th", "en", true),
+            ("ขอบคุณครับ", "th", "en", true), ("ไม่", "th", "en", true), ("เป็น", "th", "en", true),
             // Ambiguous: "ok" on the Thai layout is "นา", a real Thai word. Leave it.
-            ("ok", .english, false),
+            ("ok", "en", "th", false),
+            ("привет", "ru", "en", true), ("спасибо", "ru", "en", true), ("hello", "en", "ru", true),
+            ("привіт", "uk", "en", true), ("дякую", "uk", "en", true),
+            ("שלום", "he", "en", true), ("תודה", "he", "en", true), ("hello", "en", "he", true),
+            ("مرحبا", "ar", "en", true), ("شكرا", "ar", "en", true),
+            // Greek accents are dead keys: ΄ then a vowel.
+            ("ευχαριστώ", "el", "en", true), ("καλημέρα", "el", "en", true), ("και", "el", "en", true),
+            ("سلام", "fa", "en", true), ("здраво", "sr", "en", true), ("здравей", "bg", "en", true),
+            ("გამარჯობა", "ka", "en", true), ("շնորհակալություն", "hy", "en", true),
         ]
+        let languages = Set(cases.flatMap { [Language(rawValue: $0.language), Language(rawValue: $0.other)] })
+        let detector = Dictionaries.makeDetector(for: languages)
         var ok = true
-        for (word, language, expectSwitch) in cases {
-            let intended = language == .english ? en : th
-            let wrong = language == .english ? th : en
-            guard let strokes = strokes(for: word, in: intended), let typed = wrong.render(strokes) else {
-                print("SKIP \(word): cannot be typed on \(intended.inputSourceID)")
+        for c in cases {
+            let language = Language(rawValue: c.language), other = Language(rawValue: c.other)
+            guard let intended = layouts[language], let wrong = layouts[other] else {
+                print("SKIP \(c.word): no \(language) or \(other) layout installed")
                 continue
             }
-            // Typed on the wrong layout: should switch back to `word`.
-            let fix = detector.decide(strokes: strokes, typed: typed, current: wrong.language, layouts: layouts)
-            let fixed = fix?.replacement == word
-            // Typed on the right layout: must be left alone.
-            let leftAlone = detector.decide(strokes: strokes, typed: word, current: language, layouts: layouts) == nil
-            let pass = fixed == expectSwitch && leftAlone
+            guard detector.languages.contains(language) else {
+                print("SKIP \(c.word): no \(language) word list in Data/ (run scripts/build-app.sh)")
+                continue
+            }
+            guard let strokes = strokes(for: c.word, in: intended), let typed = wrong.render(strokes) else {
+                print("SKIP \(c.word): cannot be typed on \(intended.inputSourceID)")
+                continue
+            }
+            let pair = [language: intended, other: wrong]
+            let fix = detector.decide(strokes: strokes, typed: typed, current: other, layouts: pair)
+            let fixed = fix?.replacement == c.word
+            let leftAlone = detector.decide(strokes: strokes, typed: c.word, current: language, layouts: pair) == nil
+            let pass = fixed == c.fix && leftAlone
             ok = ok && pass
-            print("\(pass ? "PASS" : "FAIL") \(typed) → \(fix?.replacement ?? "nil")  (expected \(word); untouched-when-correct: \(leftAlone))")
+            print("\(pass ? "PASS" : "FAIL") [\(other)→\(language)] \(typed) → \(fix?.replacement ?? "nil")  (expected \(c.fix ? c.word : "nil"); untouched-when-correct: \(leftAlone))")
         }
+
         // Commands typed correctly in a terminal must be left alone even if not dictionary words.
-        for command in ["git", "kubectl", "pnpm", "chmod"] {
-            guard let strokes = strokes(for: command, in: en) else { continue }
-            let fix = detector.decide(strokes: strokes, typed: command, current: .english, layouts: layouts,
-                                      category: AppCategory(bundleID: "com.apple.Terminal"))
-            ok = ok && fix == nil
-            print("\(fix == nil ? "PASS" : "FAIL") \(command) in Terminal → \(fix?.replacement ?? "untouched")")
+        if let th = layouts[.thai] {
+            for command in ["git", "kubectl", "pnpm", "chmod"] {
+                guard let strokes = strokes(for: command, in: en) else { continue }
+                let fix = detector.decide(strokes: strokes, typed: command, current: .english,
+                                          layouts: [.english: en, .thai: th],
+                                          category: AppCategory(bundleID: "com.apple.Terminal"))
+                ok = ok && fix == nil
+                print("\(fix == nil ? "PASS" : "FAIL") \(command) in Terminal → \(fix?.replacement ?? "untouched")")
+            }
         }
+
         // Per-app language memory: needs enough words and a clear majority.
         var profile = AppLanguageProfile()
         for _ in 0..<19 { profile.record(.english, in: "code") }
@@ -61,105 +79,81 @@ enum SelfTest {
         let profilePass = tooFew && english && mixed
         ok = ok && profilePass
         print("\(profilePass ? "PASS" : "FAIL") app language profile (few: \(tooFew), dominant: \(english), mixed: \(mixed))")
-
-        if ProcessInfo.processInfo.environment["LS_PROBE"] != nil {
-            for w in (ProtectedWords.commands.union(ProtectedWords.tech)).sorted() {
-                guard let st = strokes(for: w, in: en),
-                      let fix = detector.decide(strokes: st, typed: w, current: .english, layouts: layouts) else { continue }
-                print("AT RISK \(w) → \(fix.replacement)")
-            }
-        }
         return ok
     }
 
-    /// Measures the detector on the most frequent words of each dictionary.
-    /// Usage: `swift run LangSwapper --eval [N]`
+    /// Measures the detector on the most frequent words of each bundled language,
+    /// paired with English: both directions, plus how often correct text gets changed.
     static func evaluate(top n: Int) {
-        let sources = InputSources()
-        sources.reload()
-        let layouts = sources.layouts
-        guard let en = layouts[.english], let th = layouts[.thai] else { print("need EN and TH layouts"); return }
-        let detector = Dictionaries.makeDetector()
-        for language in [Language.english, .thai] {
-            guard let url = Dictionaries.url(for: language), let text = try? String(contentsOf: url) else { continue }
-            let intended = language == .english ? en : th
-            let wrong = language == .english ? th : en
-            // [length bucket: (words, fixed, wrongly changed when typed correctly)]
-            var stats: [String: (Int, Int, Int)] = [:]
-            var falsePositives: [String] = []
-            var misses: [String] = []
-            for line in text.split(separator: "\n").prefix(n) {
-                let word = String(line.split(separator: " ").first ?? "")
-                guard let strokes = strokes(for: word, in: intended), strokes.count >= 2,
-                      let typed = wrong.render(strokes) else { continue }
-                let bucket = strokes.count <= 3 ? "\(strokes.count) keys" : "4+ keys"
-                let fixed = detector.decide(strokes: strokes, typed: typed, current: wrong.language,
-                                            layouts: layouts)?.replacement == word
-                let changed = detector.decide(strokes: strokes, typed: word, current: language, layouts: layouts) != nil
-                var s = stats[bucket] ?? (0, 0, 0)
-                s.0 += 1; s.1 += fixed ? 1 : 0; s.2 += changed ? 1 : 0
-                stats[bucket] = s
-                if changed && falsePositives.count < 12 { falsePositives.append(word) }
-                if !fixed && misses.count < 12 { misses.append("\(word)(\(typed))") }
-            }
-            print("\n\(language.rawValue) top \(n):")
-            for key in stats.keys.sorted() {
-                let (w, f, c) = stats[key]!
-                print(String(format: "  %@  words %5d  fixed %5.1f%%  wrongly changed %5.2f%%", key, w,
-                             100 * Double(f) / Double(w), 100 * Double(c) / Double(w)))
-            }
-            print("  sample misses:", misses.joined(separator: " "))
-            print("  sample wrongly changed:", falsePositives.joined(separator: " "))
-        }
+        let layouts = InputSources.installedLayouts()
+        guard let en = layouts[.english] else { print("no English layout installed"); return }
+        let languages = Language.bundled.filter { layouts[$0] != nil && Dictionaries.url(for: $0) != nil }
+        let detector = Dictionaries.makeDetector(for: languages)
+        print("lang  layout                               | fixed on EN layout | EN fixed on it | correct text changed")
+        for language in languages where language != .english {
+            let other = layouts[language]!
+            let pair = [Language.english: en, language: other]
+            let a = measure(ranked(language, n), intended: other, wrong: en, detector: detector, layouts: pair)
+            let b = measure(ranked(.english, n), intended: en, wrong: other, detector: detector, layouts: pair)
+            let changed = 100 * Double(a.changed + b.changed) / Double(max(1, a.words + b.words))
+            print(String(format: "%@  %@ |  %5.1f%% of %5d   |  %5.1f%% of %5d | %5.2f%%",
+                         language.rawValue.padding(toLength: 4, withPad: " ", startingAt: 0),
+                         other.inputSourceID.padding(toLength: 36, withPad: " ", startingAt: 0),
+                         a.rate, a.words, b.rate, b.words, changed))
+            if !a.misses.isEmpty { print("      missed:", a.misses.joined(separator: " ")) }
 
-        // Phrases: a short word followed by a long one, both typed on the wrong layout.
-        // Once the long word is fixed, rereading should recover the short word.
-        func ranked(_ language: Language) -> [String] {
-            guard let url = Dictionaries.url(for: language), let text = try? String(contentsOf: url) else { return [] }
-            return text.split(separator: "\n").prefix(n).compactMap { $0.split(separator: " ").first.map(String.init) }
-        }
-        for language in [Language.english, .thai] {
-            let intended = language == .english ? en : th
-            let wrong = language == .english ? th : en
-            let words = ranked(language)
-            let missedShort = words.filter { w in
-                guard let st = strokes(for: w, in: intended), (2...3).contains(st.count), let typed = wrong.render(st) else { return false }
-                return detector.decide(strokes: st, typed: typed, current: wrong.language, layouts: layouts)?.replacement != w
+            // Spaceless scripts: short words left alone, recovered once a later word is fixed.
+            guard detector.rereadsInto(language) else { continue }
+            let missedShort = ranked(language, n).filter { w in
+                guard let st = strokes(for: w, in: other), (2...3).contains(st.count), let typed = en.render(st) else { return false }
+                return detector.decide(strokes: st, typed: typed, current: .english, layouts: pair)?.replacement != w
             }
             let recovered = missedShort.filter { w in
-                guard let st = strokes(for: w, in: intended), let typed = wrong.render(st) else { return false }
-                return detector.reread(strokes: st, typed: typed, current: wrong.language, as: language, layouts: layouts) == w
+                guard let st = strokes(for: w, in: other), let typed = en.render(st) else { return false }
+                return detector.reread(strokes: st, typed: typed, current: .english, as: language, layouts: pair) == w
             }
-            // Mixed text: a correct short word in the other language, then a wrong-layout word in this one.
-            let otherShort = ranked(wrong.language).filter { w in
-                guard let st = strokes(for: w, in: wrong) else { return false }
-                return (2...3).contains(st.count)
+            let englishShort = ranked(.english, n).filter { (strokes(for: $0, in: en)?.count).map { (2...3).contains($0) } ?? false }
+            let converted = englishShort.filter { w in
+                detector.reread(strokes: strokes(for: w, in: en)!, typed: w, current: .english, as: language, layouts: pair) != nil
             }
-            let converted = otherShort.filter { w in
-                guard let st = strokes(for: w, in: wrong) else { return false }
-                return detector.reread(strokes: st, typed: w, current: wrong.language, as: language, layouts: layouts) != nil
-            }
-            print(String(format: "\nphrases ending in a fixed %@ word: recovered %d/%d missed short words (%.1f%%); converted %d/%d correct short %@ words (%.1f%%)",
-                         language.rawValue, recovered.count, missedShort.count, 100 * Double(recovered.count) / Double(max(1, missedShort.count)),
-                         converted.count, otherShort.count, wrong.language.rawValue, 100 * Double(converted.count) / Double(max(1, otherShort.count))))
-            print("  still missed:", missedShort.filter { !recovered.contains($0) }.prefix(15).joined(separator: " "))
-            print("  wrongly converted:", converted.prefix(15).joined(separator: " "))
+            print(String(format: "      reread: recovered %.1f%% of %d missed short words; changed %.1f%% of %d correct short English words",
+                         100 * Double(recovered.count) / Double(max(1, missedShort.count)), missedShort.count,
+                         100 * Double(converted.count) / Double(max(1, englishShort.count)), englishShort.count))
         }
     }
 
-    /// Inverts a layout to find the keystrokes that type `text`.
-    private static func strokes(for text: String, in layout: LayoutMap) -> [KeyStroke]? {
-        var inverse: [String: KeyStroke] = [:]
-        for code in UInt16(0)..<128 {
-            for shift in [false, true] {
-                let k = KeyStroke(keyCode: code, shift: shift)
-                if let s = layout.render([k]), inverse[s] == nil { inverse[s] = k }
+    private static func measure(_ words: [String], intended: LayoutMap, wrong: LayoutMap, detector: Detector,
+                                layouts: [Language: LayoutMap]) -> (words: Int, rate: Double, changed: Int, misses: [String]) {
+        var total = 0, fixed = 0, changed = 0
+        var misses: [String] = []
+        for word in words {
+            guard let st = strokes(for: word, in: intended), st.count >= 2, let typed = wrong.render(st) else { continue }
+            total += 1
+            if detector.decide(strokes: st, typed: typed, current: wrong.language, layouts: layouts)?.replacement == word {
+                fixed += 1
+            } else if misses.count < 10 {
+                misses.append("\(word)(\(typed))")
             }
+            if detector.decide(strokes: st, typed: word, current: intended.language, layouts: layouts) != nil { changed += 1 }
         }
+        return (total, 100 * Double(fixed) / Double(max(1, total)), changed, misses)
+    }
+
+    private static func ranked(_ language: Language, _ n: Int) -> [String] {
+        guard let url = Dictionaries.url(for: language), let text = try? String(contentsOf: url, encoding: .utf8) else { return [] }
+        let words = text.split(separator: "\n").prefix(n).compactMap { $0.split(separator: " ").first.map(String.init) }
+        return language.rawValue == "sr" ? words.map { SerbianScript.cyrillic($0) ?? $0 } : words
+    }
+
+    /// Inverts a layout to find the keystrokes that type `text`.
+    private static var inverses: [String: [String: [KeyStroke]]] = [:]
+    private static func strokes(for text: String, in layout: LayoutMap) -> [KeyStroke]? {
+        let inverse = inverses[layout.inputSourceID] ?? layout.inverse()
+        inverses[layout.inputSourceID] = inverse
         var out: [KeyStroke] = []
         for scalar in text.unicodeScalars {
             guard let k = inverse[String(scalar)] else { return nil }
-            out.append(k)
+            out += k
         }
         return out
     }

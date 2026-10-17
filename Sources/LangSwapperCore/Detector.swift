@@ -30,10 +30,11 @@ public final class Detector: @unchecked Sendable {
     /// Words reread after a later fix are kept when they score at least this in
     /// their own language (about the top 200 words).
     public var rereadKeepScore = 0.8
-    /// Languages earlier words may be reread into. On the top 5000 words, rereading into
-    /// Thai recovers ~80% of missed short words with 0.5% false changes; into English it
-    /// recovers few words and changes ~3% of correct short Thai words, so it is off.
-    public var rereadTargets: Set<Language> = [.thai]
+    /// Whether earlier words may be reread into a language. On the top 5000 words, rereading
+    /// into Thai recovers ~80% of missed short words with 0.5% false changes; into English it
+    /// recovers few words and changes ~3% of correct short Thai words. Languages written with
+    /// spaces rarely leave short words behind, so only spaceless scripts get rereading.
+    public var rereadsInto: @Sendable (Language) -> Bool = { $0.writesWithoutSpaces }
 
     public init(dictionaries: [Language: FrequencyDictionary]) {
         self.dictionaries = dictionaries
@@ -42,19 +43,21 @@ public final class Detector: @unchecked Sendable {
     /// 0...1 confidence that `text` is real text in `language`.
     public func score(_ text: String, as language: Language) -> Double {
         guard let dict = dictionaries[language] else { return 0 }
-        switch language {
-        case .english:
-            let word = text.trimmingCharacters(in: Self.englishEdgePunctuation).lowercased()
-            guard !word.isEmpty, word.unicodeScalars.allSatisfy(Self.isEnglishWordScalar) else { return 0 }
-            guard dict.count(of: word) > 0 else { return 0 }
-            return 0.6 + 0.4 * dict.commonness(of: word)
-        case .thai:
-            guard ThaiOrthography.isPlausible(text) else { return 0 }
+        if language.writesWithoutSpaces {
+            if language == .thai && !ThaiOrthography.isPlausible(text) { return 0 }
             if dict.count(of: text) > 0 { return 0.6 + 0.4 * dict.commonness(of: text) }
+            guard text.unicodeScalars.allSatisfy(Self.isWordScalar) else { return 0 }
             let coverage = dict.segmentCoverage(text)
             return coverage >= 0.999 ? 0.8 : coverage * coverage * 0.75
         }
+        let word = text.trimmingCharacters(in: Self.edgePunctuation).lowercased()
+        guard !word.isEmpty, word.unicodeScalars.allSatisfy(Self.isWordScalar),
+              dict.count(of: word) > 0 else { return 0 }
+        return 0.6 + 0.4 * dict.commonness(of: word)
     }
+
+    /// Languages with a loaded word list.
+    public var languages: Set<Language> { Set(dictionaries.keys) }
 
     /// - Parameter force: the user explicitly asked to convert; take the best
     ///   alternative even when neither rendering is a known word.
@@ -87,7 +90,7 @@ public final class Detector: @unchecked Sendable {
     public func reread(strokes: [KeyStroke], typed: String, current: Language, as target: Language,
                        layouts: [Language: LayoutMap], ignoring ignored: Set<String> = [],
                        category: AppCategory = .general) -> String? {
-        guard target != current, rereadTargets.contains(target), !ignored.contains(typed), !ProtectedWords.contains(typed, in: category),
+        guard target != current, rereadsInto(target), !ignored.contains(typed), !ProtectedWords.contains(typed, in: category),
               let alt = layouts[target]?.render(strokes), alt != typed else { return nil }
         let altScore = score(alt, as: target), typedScore = score(typed, as: current)
         // Common words (นา, ทำ, go) stay: mixed-language text is normal. Rare ones (fu, z) may go.
@@ -95,9 +98,12 @@ public final class Detector: @unchecked Sendable {
         return altScore >= acceptThreshold && altScore > typedScore ? alt : nil
     }
 
-    private static let englishEdgePunctuation = CharacterSet(charactersIn: ".,!?;:\"'()[]{}<>")
-    private static func isEnglishWordScalar(_ s: Unicode.Scalar) -> Bool {
-        (s.value >= 0x61 && s.value <= 0x7A) || (s.value >= 0x41 && s.value <= 0x5A) || s == "'" || s == "-"
+    private static let edgePunctuation = CharacterSet.punctuationCharacters.union(.symbols)
+        .subtracting(CharacterSet(charactersIn: "'’-"))
+    /// Letters and combining marks of any script, plus in-word apostrophes and hyphens.
+    private static func isWordScalar(_ s: Unicode.Scalar) -> Bool {
+        s.properties.isAlphabetic || s.properties.generalCategory == .nonspacingMark
+            || s.properties.generalCategory == .spacingMark || s == "'" || s == "’" || s == "-"
     }
 }
 

@@ -1,8 +1,9 @@
 # LangSwapper
 
 A macOS menu-bar app that fixes words typed on the wrong keyboard layout
-(`้ำสสน` → `hello`, `l;ylfu` → `สวัสดี`) and switches the layout for you.
-It supports English (ABC/US) and Thai.
+(`ghbdtn` → `привет`, `akuo` → `שלום`, `l;ylfu` → `สวัสดี`, `руддщ` → `hello`)
+and switches the layout for you. It works with any layout macOS has; detection
+needs a word list for the layout's language.
 
 ## Build and run
 
@@ -12,10 +13,49 @@ Requires macOS 13 or later and Xcode command-line tools.
 ./scripts/build-app.sh           # downloads word lists, builds build/LangSwapper.app
 open build/LangSwapper.app       # grant Accessibility access when asked
 swift run LangSwapper --selftest # detector checks against this Mac's real layouts
-swift run LangSwapper --eval 5000 # fix rate and false changes on the 5000 most common words
+swift run LangSwapper --eval 5000 # per-language fix rate, using every layout installed on this Mac
 ```
 
-Enable both an English layout (ABC or US) and the Thai layout in System Settings → Keyboard → Input Sources.
+Enable the layouts you type with in System Settings → Keyboard → Input Sources.
+LangSwapper loads word lists only for the layouts you have enabled.
+
+## Languages
+
+Measured with `swift run LangSwapper --eval 5000` on each language's 5000 most
+frequent words, paired with English. "Fixed" is the share of words typed on the
+wrong layout that get corrected; "changed" is the share of correctly typed words
+that get changed by mistake.
+
+| Language | Layout | Fixed (typed on EN) | EN fixed (typed on it) | Changed |
+|---|---|---|---|---|
+| Russian | Russian | 98.2% | 99.3% | 0.02% |
+| Ukrainian | Ukrainian | 97.2% | 99.3% | 0.03% |
+| Bulgarian | Bulgarian | 96.6% | 99.0% | 0.01% |
+| Serbian | Serbian | 88.7% | 78.6% | 0.08% |
+| Macedonian | Macedonian | 89.8% | 88.8% | 0.08% |
+| Kazakh | Kazakh | 99.2% | 99.8% | 0.00% |
+| Greek | Greek | 96.6% | 96.3% | 0.03% |
+| Hebrew | Hebrew | 93.7% | 96.9% | 0.02% |
+| Arabic | Arabic | 95.4% | 98.6% | 0.02% |
+| Persian | Persian | 93.2% | 98.7% | 0.07% |
+| Urdu | Urdu | 87.7% | 97.5% | 0.11% |
+| Armenian | Armenian HM QWERTY | 91.1% | 98.4% | 0.04% |
+| Georgian | Georgian QWERTY | 93.4% | 98.1% | 0.01% |
+| Hindi | Devanagari | 92.7% | 99.0% | 0.10% |
+| Thai | Thai | 96.0% | 99.0% | 0.02% |
+
+Most misses are two-letter words that are real words in both languages
+(`да`/`lf`, `το`/`to`). Serbian and Macedonian layouts are phonetic, so many
+English words are also valid Cyrillic words. The Serbian list is mostly Latin
+script and is transliterated to Cyrillic on load. Greek accents are typed with
+dead keys, which are supported. Thai (and other scripts without spaces) also
+rereads short words once a later word is fixed: 82% of missed short Thai words
+are recovered.
+
+Adding a language: add its code to `Language.bundled` and to the list in
+`scripts/build-app.sh`, run `--eval`, and add a few words to `SelfTest`.
+Layouts that are input methods (Japanese, Chinese, Korean) have no key map and
+aren't supported.
 
 The build is ad-hoc signed by default, so macOS drops Accessibility access
 after each rebuild. To keep it, sign with a stable certificate:
@@ -38,7 +78,7 @@ System Settings → Privacy & Security → Accessibility and add it again.
 
 1. A `CGEventTap` records each key press as a physical key code plus Shift, not as a character.
 2. When a word ends, the key presses are re-rendered on every enabled layout. The layouts are read with `TISCopyInputSourceForLanguage` and `UCKeyTranslate`.
-3. Each rendering is scored against a word-frequency list. Thai has no spaces between words, so it is scored by how much of it splits into dictionary words, plus checks that reject impossible vowel and tone-mark orders.
+3. Each rendering is scored by how common it is in that language's word list, using its rank so languages with small corpora compare fairly. Scripts written without spaces (Thai, Lao, Khmer, Burmese) are scored by how much of the text splits into dictionary words; Thai also rejects impossible vowel and tone-mark orders.
 4. If the typed text isn't a word and another rendering is a confident one, the word is erased with Backspace and retyped as Unicode. Then the layout is switched with `TISSelectInputSource`.
 
 Code layout:
@@ -63,7 +103,7 @@ password boxes.
 - Detect Thai mid-phrase, before a space is typed.
 - Learn the user's own vocabulary.
 - Remember the language per website in browsers.
-- Add more languages.
+- Latin-to-Latin layouts (AZERTY, QWERTZ, Dvorak), where wrong-layout text still looks like letters.
 
 ## Credits and license
 
